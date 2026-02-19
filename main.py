@@ -20,7 +20,6 @@ from enum import Enum
 if os.path.exists("firebase-service-account.json"):
     cred = credentials.Certificate("firebase-service-account.json")
 else:
-    # Use environment variable on Render
     firebase_creds = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH") or os.getenv("FIREBASE_CREDENTIALS")
     if firebase_creds:
         cred = credentials.Certificate(json.loads(firebase_creds))
@@ -33,7 +32,6 @@ db = firestore.client()
 app = FastAPI(title="Nova Meet API")
 security = HTTPBearer()
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "https://localhost:3000", "https://novameetx22.web.app"],
@@ -42,7 +40,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Socket.IO server
 sio = socketio.AsyncServer(
     cors_allowed_origins=["http://localhost:3000", "https://localhost:3000", "https://novameetx22.web.app"],
     async_mode='asgi',
@@ -51,7 +48,6 @@ sio = socketio.AsyncServer(
 )
 socket_app = socketio.ASGIApp(sio, app)
 
-# Enhanced data structures for SFU architecture
 class ParticipantRole(Enum):
     HOST = "host"
     PARTICIPANT = "participant"
@@ -83,9 +79,8 @@ class Meeting:
     is_recording: bool = False
     waiting_room_enabled: bool = False
     
-# In-memory storage for active connections only
 socket_to_user: Dict[str, dict] = {}
-active_speakers: Dict[str, str] = {}  # meeting_id -> current_speaker_uid
+active_speakers: Dict[str, str] = {}
 
 def generate_meeting_code():
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=3)) + '-' + \
@@ -94,7 +89,6 @@ def generate_meeting_code():
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
         "service": "Nova Meet API",
         "version": "2.0.0",
@@ -121,7 +115,6 @@ async def verify_firebase_token(credentials: HTTPAuthorizationCredentials = Depe
 async def create_meeting(user: dict = Depends(verify_firebase_token)):
     meeting_code = generate_meeting_code()
     
-    # Check if code exists in Firestore
     while db.collection('meetings').document(meeting_code).get().exists:
         meeting_code = generate_meeting_code()
     
@@ -148,7 +141,6 @@ async def create_meeting(user: dict = Depends(verify_firebase_token)):
 
 @app.get("/api/meetings")
 async def list_meetings(user: dict = Depends(verify_firebase_token)):
-    """List all active meetings"""
     meetings_ref = db.collection('meetings').where('status', '==', 'active').stream()
     meetings_list = []
     
@@ -209,10 +201,7 @@ async def end_meeting(meeting_code: str, user: dict = Depends(verify_firebase_to
     if meeting_data['host_uid'] != user["uid"]:
         raise HTTPException(status_code=403, detail="Only host can end meeting")
     
-    # Notify all participants
     await sio.emit('meeting-ended', {'reason': 'Host ended the meeting'}, room=meeting_code)
-    
-    # Update meeting status
     db.collection('meetings').document(meeting_code).update({'status': 'ended'})
     
     return {"message": "Meeting ended successfully"}
@@ -229,21 +218,19 @@ async def connect(sid, environ, auth):
             return False
         
         try:
-            decoded_token = auth.verify_id_token(token)
+            from firebase_admin import auth as firebase_auth
+            decoded_token = firebase_auth.verify_id_token(token)
         except Exception as e:
             print(f"Token verification failed: {e}")
-            await sio.disconnect(sid)
             return False
             
         user_id = decoded_token["uid"]
         user_name = decoded_token.get("name", decoded_token.get("email", "Unknown"))
         
-        # Check if meeting exists in Firestore
         meeting_doc = db.collection('meetings').document(meeting_code).get()
         if not meeting_doc.exists:
             print(f"Meeting not found: {meeting_code}")
             await sio.emit('error', {'message': 'Meeting not found'}, room=sid)
-            await sio.disconnect(sid)
             return False
         
         meeting_data = meeting_doc.to_dict()
@@ -263,7 +250,6 @@ async def connect(sid, environ, auth):
             "connection_quality": "good"
         }
         
-        # Save participant to Firestore
         db.collection('meetings').document(meeting_code).collection('participants').document(user_id).set(participant_data)
         
         socket_to_user[sid] = {
@@ -275,29 +261,24 @@ async def connect(sid, environ, auth):
         }
         
         await sio.enter_room(sid, meeting_code)
+        print(f"User {user_name} joined meeting {meeting_code}")
         
-        # Get existing participants from Firestore
         participants_ref = db.collection('meetings').document(meeting_code).collection('participants').stream()
-        existing_participants = [p.to_dict() for p in participants_ref if p.id != user_id]
+        all_participants = [p.to_dict() for p in participants_ref]
         
-        # Send existing participants to new user
-        for existing_p in existing_participants:
-            await sio.emit('user-joined', existing_p, room=sid)
-        
-        # Notify others about new participant
+        await sio.emit('participants-update', all_participants, room=sid)
+        await sio.emit('user-joined', participant_data, room=sid)
         await sio.emit('user-joined', participant_data, room=meeting_code, skip_sid=sid)
+        await sio.emit('participants-update', all_participants, room=meeting_code)
         
-        # Send meeting info
-        await sio.emit('meeting-info', {
-            'meeting': meeting_data,
-            'your_role': role.value,
-            'participant_count': len(existing_participants) + 1
-        }, room=sid)
+        print(f"Participants in meeting: {len(all_participants)}")
+        return True
         
     except Exception as e:
         print(f"Connection error: {e}")
-        await sio.emit('error', {'message': 'Authentication failed'}, room=sid)
-        await sio.disconnect(sid)
+        import traceback
+        traceback.print_exc()
+        return False
 
 @sio.event
 async def disconnect(sid):
@@ -306,7 +287,6 @@ async def disconnect(sid):
         meeting_code = user_info["meeting_code"]
         user_id = user_info["uid"]
         
-        # Remove participant from Firestore
         db.collection('meetings').document(meeting_code).collection('participants').document(user_id).delete()
         
         await sio.emit('user-left', {
@@ -315,42 +295,24 @@ async def disconnect(sid):
             "sid": sid
         }, room=meeting_code)
         
-        # Update active speaker if this was the active speaker
         if meeting_code in active_speakers and active_speakers[meeting_code] == user_id:
             del active_speakers[meeting_code]
             await sio.emit('active-speaker-changed', {'speaker_uid': None}, room=meeting_code)
         
         del socket_to_user[sid]
 
-# SFU-Ready WebRTC Signaling Events
-@sio.event
-async def join_room(sid, data):
-    """Join media room - SFU integration point"""
-    if sid in socket_to_user:
-        user_info = socket_to_user[sid]
-        meeting_code = user_info["meeting_code"]
-        
-        # This is where SFU media server integration happens
-        # For now, emit to all participants for P2P fallback
-        await sio.emit('participant-ready-to-connect', {
-            'uid': user_info['uid'],
-            'sid': sid
-        }, room=meeting_code, skip_sid=sid)
-
 @sio.event
 async def offer(sid, data):
-    """WebRTC offer - will route through SFU in Phase 2"""
     target_sid = data.get('to')
     if target_sid:
         await sio.emit('offer', {
             'offer': data['offer'],
             'from': sid,
-            'type': data.get('type', 'video')  # video, audio, screen
+            'type': data.get('type', 'video')
         }, room=target_sid)
 
 @sio.event
 async def answer(sid, data):
-    """WebRTC answer - will route through SFU in Phase 2"""
     target_sid = data.get('to')
     if target_sid:
         await sio.emit('answer', {
@@ -361,7 +323,6 @@ async def answer(sid, data):
 
 @sio.event
 async def ice_candidate(sid, data):
-    """ICE candidate - will route through SFU in Phase 2"""
     target_sid = data.get('to')
     if target_sid:
         await sio.emit('ice-candidate', {
@@ -369,7 +330,6 @@ async def ice_candidate(sid, data):
             'from': sid
         }, room=target_sid)
 
-# Media Control Events
 @sio.event
 async def toggle_audio(sid, data):
     if sid in socket_to_user:
@@ -377,7 +337,6 @@ async def toggle_audio(sid, data):
         meeting_code = user_info["meeting_code"]
         user_id = user_info["uid"]
         
-        # Update in Firestore
         db.collection('meetings').document(meeting_code).collection('participants').document(user_id).update({
             'is_audio_on': data.get('isAudioOn', False)
         })
@@ -394,7 +353,6 @@ async def toggle_video(sid, data):
         meeting_code = user_info["meeting_code"]
         user_id = user_info["uid"]
         
-        # Update in Firestore
         db.collection('meetings').document(meeting_code).collection('participants').document(user_id).update({
             'is_video_on': data.get('isVideoOn', False)
         })
@@ -404,54 +362,6 @@ async def toggle_video(sid, data):
             'isVideoOn': data.get('isVideoOn', False)
         }, room=meeting_code)
 
-@sio.event
-async def start_screen_share(sid, data):
-    if sid in socket_to_user:
-        user_info = socket_to_user[sid]
-        meeting_code = user_info["meeting_code"]
-        user_id = user_info["uid"]
-        
-        db.collection('meetings').document(meeting_code).collection('participants').document(user_id).update({
-            'is_screen_sharing': True
-        })
-        
-        await sio.emit('screen-share-started', {
-            'uid': user_id,
-            'name': user_info['name']
-        }, room=meeting_code)
-
-@sio.event
-async def stop_screen_share(sid, data):
-    if sid in socket_to_user:
-        user_info = socket_to_user[sid]
-        meeting_code = user_info["meeting_code"]
-        user_id = user_info["uid"]
-        
-        db.collection('meetings').document(meeting_code).collection('participants').document(user_id).update({
-            'is_screen_sharing': False
-        })
-        
-        await sio.emit('screen-share-stopped', {
-            'uid': user_id
-        }, room=meeting_code)
-
-@sio.event
-async def active_speaker(sid, data):
-    """Track active speaker for SFU optimization"""
-    if sid in socket_to_user:
-        user_info = socket_to_user[sid]
-        meeting_code = user_info["meeting_code"]
-        user_id = user_info["uid"]
-        
-        # Update active speaker
-        active_speakers[meeting_code] = user_id
-        
-        await sio.emit('active-speaker-changed', {
-            'speaker_uid': user_id,
-            'speaker_name': user_info['name']
-        }, room=meeting_code, skip_sid=sid)
-
-# Enhanced Chat System
 @sio.event
 async def chat_message(sid, data):
     if sid in socket_to_user:
@@ -464,60 +374,10 @@ async def chat_message(sid, data):
             'sender': user_info['name'],
             'sender_uid': user_info['uid'],
             'timestamp': datetime.now(timezone.utc).isoformat(),
-            'type': data.get('type', 'text')  # text, emoji, file
+            'type': data.get('type', 'text')
         }
         
         await sio.emit('chat-message', message, room=meeting_code)
-
-# Host Control Events
-@sio.event
-async def mute_participant(sid, data):
-    """Host can mute participants"""
-    if sid in socket_to_user:
-        user_info = socket_to_user[sid]
-        meeting_code = user_info["meeting_code"]
-        target_uid = data.get('target_uid')
-        
-        # Check if user is host
-        meeting_doc = db.collection('meetings').document(meeting_code).get()
-        if meeting_doc.exists:
-            meeting_data = meeting_doc.to_dict()
-            if meeting_data['host_uid'] == user_info['uid']:
-                # Find target participant's socket
-                for s_id, s_user in socket_to_user.items():
-                    if s_user['uid'] == target_uid and s_user['meeting_code'] == meeting_code:
-                        await sio.emit('force-mute', {'reason': 'Muted by host'}, room=s_id)
-                        
-                        db.collection('meetings').document(meeting_code).collection('participants').document(target_uid).update({
-                            'is_audio_on': False
-                        })
-                        
-                        await sio.emit('participant-audio-changed', {
-                            'uid': target_uid,
-                            'isAudioOn': False,
-                            'muted_by_host': True
-                        }, room=meeting_code)
-                        break
-
-@sio.event
-async def remove_participant(sid, data):
-    """Host can remove participants"""
-    if sid in socket_to_user:
-        user_info = socket_to_user[sid]
-        meeting_code = user_info["meeting_code"]
-        target_uid = data.get('target_uid')
-        
-        # Check if user is host
-        meeting_doc = db.collection('meetings').document(meeting_code).get()
-        if meeting_doc.exists:
-            meeting_data = meeting_doc.to_dict()
-            if meeting_data['host_uid'] == user_info['uid']:
-                # Find target participant's socket
-                for s_id, s_user in socket_to_user.items():
-                    if s_user['uid'] == target_uid and s_user['meeting_code'] == meeting_code:
-                        await sio.emit('removed-from-meeting', {'reason': 'Removed by host'}, room=s_id)
-                        await sio.disconnect(s_id)
-                        break
 
 @sio.event
 async def raise_hand(sid, data):
@@ -526,7 +386,7 @@ async def raise_hand(sid, data):
         meeting_code = user_info["meeting_code"]
         user_id = user_info["uid"]
         
-        is_hand_raised = data.get('isHandRaised', False)
+        is_hand_raised = data.get('raised', False)
         db.collection('meetings').document(meeting_code).collection('participants').document(user_id).update({
             'is_hand_raised': is_hand_raised
         })
@@ -537,41 +397,21 @@ async def raise_hand(sid, data):
             'isHandRaised': is_hand_raised
         }, room=meeting_code)
 
-# Connection Quality Monitoring
 @sio.event
-async def connection_quality(sid, data):
-    """Monitor connection quality for SFU optimization"""
+async def reaction(sid, data):
     if sid in socket_to_user:
         user_info = socket_to_user[sid]
         meeting_code = user_info["meeting_code"]
-        user_id = user_info["uid"]
-        quality = data.get('quality', 'good')
         
-        db.collection('meetings').document(meeting_code).collection('participants').document(user_id).update({
-            'connection_quality': quality
-        })
-        
-        # Only notify host about poor connections
-        if quality == 'poor':
-            meeting_doc = db.collection('meetings').document(meeting_code).get()
-            if meeting_doc.exists:
-                meeting_data = meeting_doc.to_dict()
-                host_uid = meeting_data['host_uid']
-                
-                # Find host's socket
-                for s_id, s_user in socket_to_user.items():
-                    if s_user['uid'] == host_uid and s_user['meeting_code'] == meeting_code:
-                        await sio.emit('participant-connection-poor', {
-                            'uid': user_id,
-                            'name': user_info['name'],
-                            'quality': quality
-                        }, room=s_id)
-                        break
+        await sio.emit('reaction', {
+            'uid': user_info['uid'],
+            'name': user_info['name'],
+            'emoji': data.get('emoji'),
+            'timestamp': data.get('timestamp')
+        }, room=meeting_code, skip_sid=sid)
 
-# Health Check and Monitoring Endpoints
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for load balancers"""
     meetings_ref = db.collection('meetings').where('status', '==', 'active').stream()
     active_meetings = len(list(meetings_ref))
     
@@ -585,7 +425,6 @@ async def health_check():
 
 @app.get("/api/stats")
 async def get_stats(user: dict = Depends(verify_firebase_token)):
-    """Get server statistics"""
     meetings_ref = db.collection('meetings').where('status', '==', 'active').stream()
     active_meetings = len(list(meetings_ref))
     
