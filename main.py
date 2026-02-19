@@ -34,17 +34,20 @@ security = HTTPBearer()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://localhost:3000", "https://novameetx22.web.app"],
+    allow_origins=["http://localhost:3000", "https://localhost:3000", "https://novameetx22.web.app", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 sio = socketio.AsyncServer(
-    cors_allowed_origins=["http://localhost:3000", "https://localhost:3000", "https://novameetx22.web.app"],
+    cors_allowed_origins=["http://localhost:3000", "https://localhost:3000", "https://novameetx22.web.app", "*"],
     async_mode='asgi',
     ping_timeout=60,
-    ping_interval=25
+    ping_interval=25,
+    logger=True,
+    engineio_logger=True,
+    always_connect=True
 )
 socket_app = socketio.ASGIApp(sio, app)
 
