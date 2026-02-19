@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -16,7 +17,16 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 
 # Initialize Firebase Admin
-cred = credentials.Certificate("firebase-service-account.json")
+if os.path.exists("firebase-service-account.json"):
+    cred = credentials.Certificate("firebase-service-account.json")
+else:
+    # Use environment variable on Render
+    firebase_creds = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH") or os.getenv("FIREBASE_CREDENTIALS")
+    if firebase_creds:
+        cred = credentials.Certificate(json.loads(firebase_creds))
+    else:
+        raise Exception("Firebase credentials not found")
+
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
@@ -81,6 +91,20 @@ def generate_meeting_code():
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=3)) + '-' + \
            ''.join(random.choices(string.ascii_lowercase + string.digits, k=4)) + '-' + \
            ''.join(random.choices(string.ascii_lowercase + string.digits, k=1))
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "service": "Nova Meet API",
+        "version": "2.0.0",
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "meetings": "/api/meetings",
+            "stats": "/api/stats"
+        }
+    }
 
 async def verify_firebase_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
