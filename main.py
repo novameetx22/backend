@@ -263,15 +263,22 @@ async def connect(sid, environ, auth):
         await sio.enter_room(sid, meeting_code)
         print(f"User {user_name} joined meeting {meeting_code}")
         
+        # Get all existing participants
         participants_ref = db.collection('meetings').document(meeting_code).collection('participants').stream()
         all_participants = [p.to_dict() for p in participants_ref]
         
+        print(f"Total participants in meeting: {len(all_participants)}")
+        print(f"Participant list: {[p['name'] for p in all_participants]}")
+        
+        # Send complete participant list to new user
         await sio.emit('participants-update', all_participants, room=sid)
-        await sio.emit('user-joined', participant_data, room=sid)
+        
+        # Notify all others about new participant (broadcast to room except sender)
         await sio.emit('user-joined', participant_data, room=meeting_code, skip_sid=sid)
+        
+        # Broadcast updated participants list to everyone in the room
         await sio.emit('participants-update', all_participants, room=meeting_code)
         
-        print(f"Participants in meeting: {len(all_participants)}")
         return True
         
     except Exception as e:
@@ -287,13 +294,24 @@ async def disconnect(sid):
         meeting_code = user_info["meeting_code"]
         user_id = user_info["uid"]
         
+        print(f"User {user_info['name']} disconnected from meeting {meeting_code}")
+        
+        # Remove participant from Firestore
         db.collection('meetings').document(meeting_code).collection('participants').document(user_id).delete()
         
+        # Notify others that user left
         await sio.emit('user-left', {
             "uid": user_id,
             "name": user_info["name"],
             "sid": sid
         }, room=meeting_code)
+        
+        # Get updated participant list and broadcast
+        participants_ref = db.collection('meetings').document(meeting_code).collection('participants').stream()
+        remaining_participants = [p.to_dict() for p in participants_ref]
+        await sio.emit('participants-update', remaining_participants, room=meeting_code)
+        
+        print(f"Remaining participants: {len(remaining_participants)}")
         
         if meeting_code in active_speakers and active_speakers[meeting_code] == user_id:
             del active_speakers[meeting_code]
